@@ -43,7 +43,7 @@ export function inspectDataDir(env: Env = process.env): DataDirInfo {
   } else if (onRailway) {
     warning =
       "No Railway Volume is attached to this service — history and setup are wiped on every restart / deploy. " +
-      "Add one: service → Settings → Volumes → New Volume (mount path /app/data).";
+      "Add one: right-click the project canvas (or press Ctrl/⌘+K) → Volume → pick the bot service → mount path /app/data.";
   }
   return { dir, volume, onRailway, warning };
 }

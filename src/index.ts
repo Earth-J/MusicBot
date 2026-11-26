@@ -264,6 +264,14 @@ async function getQueueChannel(guildId: string) {
   if (!id) return null; // no music room and no QUEUE_CHANNEL_ID → no panel
   const ch = await client.channels.fetch(id).catch((e: any) => {
     console.warn(`[earth] cannot fetch queue channel ${id}:`, e?.message ?? e);
+    // 10003 = Unknown Channel: Discord says it no longer exists. If it was the music room (deleted while
+    // the bot was offline, so ChannelDelete never fired) forget it instead of failing on every update.
+    // Any other error (missing permission, network blip) keeps the setup.
+    if (e?.code === 10003 && setupStore.get(guildId)?.channelId === id) {
+      console.log(`[earth] music room ${id} no longer exists — setup removed for guild=${guildId}`);
+      queueMessages.delete(guildId);
+      setupStore.delete(guildId);
+    }
     return null;
   });
   if (!ch || !ch.isSendable()) {

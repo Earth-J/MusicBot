@@ -95,7 +95,7 @@ LAVALINK_SECURE=false
 
 จากนั้นกด **Deploy** (Railway จะ build จาก `Dockerfile` ที่ root ให้เอง)
 
-**ถ้าจะใช้ห้องเพลง (`/earth setup`):** บอทเก็บห้องที่ตั้งไว้ใน `/app/data/setup.json` แต่ไฟล์ใน container ของ Railway หายทุกครั้งที่ deploy ใหม่ — ไปที่ service `bot` → **Settings → Volumes → New Volume** แล้วตั้ง Mount Path เป็น `/app/data` (หรือกำหนดโฟลเดอร์เองด้วย `DATA_DIR`)
+**ถ้าจะใช้ห้องเพลง (`/earth setup`):** บอทเก็บห้องที่ตั้งไว้ใน `/app/data/setup.json` แต่ไฟล์ใน container ของ Railway หายทุกครั้งที่ deploy ใหม่ — คลิกขวาที่ว่างบน canvas ของโปรเจกต์ (หรือกด `Ctrl/⌘ + K`) → **Volume** → เลือก service `bot` → ตั้ง Mount Path เป็น `/app/data` (หรือกำหนดโฟลเดอร์เองด้วย `DATA_DIR`)
 
 > **ประวัติเพลงหายหลัง restart?** ไฟล์ `music-history.db` อยู่โฟลเดอร์เดียวกับ `setup.json` — ถ้าไม่มี Volume จะหายทุกครั้งที่ restart/deploy. บอทจะหาโฟลเดอร์เก็บข้อมูลตามลำดับ `DATA_DIR` → mount path ของ Volume (Railway ใส่ตัวแปร `RAILWAY_VOLUME_MOUNT_PATH` ให้เอง) → `./data` ดูใน Logs ตอนบอทเปิด: บรรทัด `[data] folder: ...` ต้องมีวงเล็บ `(Railway Volume ...)` และ `[history] opened — N plays saved so far` ต้องไม่รีเซ็ตเป็น 0 ทุกรอบ ถ้าเห็น `[data] ⚠️` แปลว่ายังไม่ได้ผูก Volume หรือ `DATA_DIR` ชี้ไปนอก Volume
 

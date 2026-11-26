@@ -247,7 +247,7 @@ export const HISTORY_PREFIX = "mh:";
  * button can redraw the same view without any server-side state (the panel is an ephemeral
  * message, one per person). <sort> is "r" (most recently played) or "p" (most played).
  *   mh:pick:<sort>:<page>              the dropdown (its value is a video id)
- *   mh:page:<sort>:<page>              ⏮ <:Gemini_Generated_Image_402sjg402:1569243289964519494> <:4303discordcategorycollapsedwhit:1569242059251130389> ⏭, the two sort buttons (→ page 0) and "back to the list"
+ *   mh:page|first|prev|next|last|sort:<sort>:<page>   ⏮ <:Gemini_Generated_Image_402sjg402:1569243289964519494> <:4303discordcategorycollapsedwhit:1569242059251130389> ⏭, the two sort buttons (→ page 0) and "back to the list"
  *   mh:play:<sort>:<page>:<video id>   เล่นเลย
  *   mh:add:<sort>:<page>:<video id>    เพิ่มเข้าคิว
  */
@@ -275,6 +275,17 @@ function pageId(sort: HistorySort, page: number): string {
   return `${HISTORY_ID.pagePrefix}${SORT_CODE[sort]}:${page}`;
 }
 
+/**
+ * Buttons that all mean "show page N" (⏮ ◀ ▶ ⏭ and the two sort buttons) get their own id word.
+ * Discord refuses a message in which two components share a custom_id, and those buttons often point
+ * at the same page (⏮ and ◀ on page 2; ▶ and ⏭ on the second to last page; ⏮ and the sort button on
+ * page 1) — so the target page alone can not be the id. parseHistoryId treats all of them as "page".
+ */
+type NavKind = "first" | "prev" | "next" | "last" | "sort";
+function navId(kind: NavKind, sort: HistorySort, page: number): string {
+  return `mh:${kind}:${SORT_CODE[sort]}:${Math.max(0, page)}`;
+}
+
 export interface HistoryAction {
   kind: "pick" | "page" | "play" | "add";
   sort: HistorySort;
@@ -284,13 +295,15 @@ export interface HistoryAction {
   videoId: string | null;
 }
 
-const HISTORY_ID_RE = /^mh:(pick|page|play|add):([rp]):(\d{1,6})(?::([\w-]{11}))?$/;
+const HISTORY_ID_RE = /^mh:(pick|page|play|add|first|prev|next|last|sort):([rp]):(\d{1,6})(?::([\w-]{11}))?$/;
 
 /** customId → what was clicked; null for anything that is not a history id (or is malformed). */
 export function parseHistoryId(customId: string): HistoryAction | null {
   const m = HISTORY_ID_RE.exec(customId);
   if (!m) return null;
-  const kind = m[1] as HistoryAction["kind"];
+  const word = m[1] as string;
+  const kind: HistoryAction["kind"] =
+    word === "pick" || word === "play" || word === "add" ? word : "page"; // page / first / prev / next / last / sort
   const sort = SORT_FROM_CODE[m[2] ?? ""];
   const videoId = m[4] ?? null;
   if (!sort) return null;
@@ -368,24 +381,24 @@ export function buildHistoryPanel({ entries, sort, page, pages, total, notice }:
 
 /** ⏮ first · <:Gemini_Generated_Image_402sjg402:1569243289964519494> previous · "2/5" · <:4303discordcategorycollapsedwhit:1569242059251130389> next · ⏭ last (the ends grey out on the first / last page). */
 function buildHistoryNavRow(page: number, pages: number, sort: HistorySort): ActionRowBuilder<ButtonBuilder> {
-  const go = (label: string, target: number, off: boolean) =>
+  const go = (kind: NavKind, label: string, target: number, off: boolean) =>
     new ButtonBuilder()
-      .setCustomId(pageId(sort, target))
+      .setCustomId(navId(kind, sort, target))
       .setLabel(label)
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(off);
   const first = page <= 0;
   const last = page >= pages - 1;
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    go("⏮", 0, first),
-    go("<:Gemini_Generated_Image_402sjg402:1569243289964519494>", page - 1, first),
+    go("first", "⏮", 0, first),
+    go("prev", "<:Gemini_Generated_Image_402sjg402:1569243289964519494>", page - 1, first),
     new ButtonBuilder()
       .setCustomId(HISTORY_ID.indicator)
       .setLabel(`${page + 1}/${pages}`)
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(true),
-    go("<:4303discordcategorycollapsedwhit:1569242059251130389>", page + 1, last),
-    go("⏭", pages - 1, last),
+    go("next", "<:4303discordcategorycollapsedwhit:1569242059251130389>", page + 1, last),
+    go("last", "⏭", pages - 1, last),
   );
 }
 
@@ -393,7 +406,7 @@ function buildHistoryNavRow(page: number, pages: number, sort: HistorySort): Act
 function buildHistorySortRow(sort: HistorySort): ActionRowBuilder<ButtonBuilder> {
   const btn = (which: HistorySort, emoji: string) =>
     new ButtonBuilder()
-      .setCustomId(pageId(which, 0))
+      .setCustomId(navId("sort", which, 0))
       .setEmoji(emoji)
       .setLabel(SORT_TEXT[which])
       .setStyle(which === sort ? ButtonStyle.Primary : ButtonStyle.Secondary);
