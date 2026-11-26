@@ -1,0 +1,903 @@
+/**
+ * Lavalink music backend (via Shoukaku).
+ *
+ * One bot does everything: it receives slash commands / typed song names AND holds the voice
+ * connection (Shoukaku asks Lavalink to stream audio into it, so no audio is decoded or
+ * encoded in this process). The discord.js Client is created in index.ts and passed in.
+ *
+ * Env:
+ *   LAVALINK_NODES         optional JSON array of nodes, in priority order (first = primary,
+ *                          the rest = fallbacks), e.g.
+ *                          [{"name":"own","url":"host:2333","auth":"pw","secure":false},
+ *                           {"name":"backup","url":"host2:443","auth":"pw2","secure":true}]
+ *                          When set, LAVALINK_HOST/PASSWORD/SECURE below are ignored.
+ *   LAVALINK_HOST          default "localhost:2333"   (single-node mode)
+ *   LAVALINK_PASSWORD      default "youshallnotpass"
+ *   LAVALINK_SECURE        "true" for wss/https
+ *   LAVALINK_REVIVE_MS     how often a dead node is retried (default 30000, 0 = never)
+ *   LAVALINK_SEARCH_PREFIX default "ytsearch:" (needs the youtube-source plugin)
+ *   MUSIC_VOLUME           starting volume 0–1, default 0.5 (the 🔉 / 🔊 buttons change it ±5%)
+ *   MUSIC_MAX_MINUTES      skip results longer than this (default 20)
+ *   MUSIC_MAX_QUEUE        max songs waiting in the queue per server (default 50);
+ *                          also the most a pasted playlist can add
+ */
+import type { Client } from "discord.js";
+import { Connectors, Constants, Shoukaku, type Node, type NodeOption, type Player } from "shoukaku";
+import { TrackQueue, type LoopMode } from "./queue.ts";
+
+export type { LoopMode } from "./queue.ts";
+import { filterPlayable, parseMusicQuery, pickCandidate, type MusicQuery } from "./query.ts";
+import { queryKey, type MusicHistory } from "./history.ts";
+
+const HOST = process.env.LAVALINK_HOST || "localhost:2333";
+const PASSWORD = process.env.LAVALINK_PASSWORD || "youshallnotpass";
+const SECURE = process.env.LAVALINK_SECURE === "true";
+const REVIVE_MS = process.env.LAVALINK_REVIVE_MS !== undefined && process.env.LAVALINK_REVIVE_MS !== ""
+  ? Math.max(0, Number(process.env.LAVALINK_REVIVE_MS) || 0)
+  : 30_000;
+let REVIVE_DISABLED = false;
+const SEARCH_PREFIX = process.env.LAVALINK_SEARCH_PREFIX || "ytsearch:";
+const MAX_MS = (Number(process.env.MUSIC_MAX_MINUTES) || 20) * 60_000;
+const MAX_QUEUE = Number(process.env.MUSIC_MAX_QUEUE) || 50;
+const envVolume = Number(process.env.MUSIC_VOLUME);
+/** Lavalink volume is in percent (100 = normal). Default starting volume. */
+const DEFAULT_VOLUME_PCT = Math.round(
+  (process.env.MUSIC_VOLUME && Number.isFinite(envVolume)
+    ? Math.min(Math.max(envVolume, 0), 1)
+    : 0.5) * 100,
+);
+
+/**
+ * Lavalink nodes, in priority order. LAVALINK_NODES (JSON array) wins; otherwise the single
+ * node from LAVALINK_HOST / LAVALINK_PASSWORD / LAVALINK_SECURE.
+ */
+function loadNodes(): NodeOption[] {
+  const raw = process.env.LAVALINK_NODES?.trim();
+  if (raw) {
+    try {
+      const arr = JSON.parse(raw);
+      if (!Array.isArray(arr) || arr.length === 0) throw new Error("must be a non-empty array");
+      const seen = new Set<string>();
+      const nodes = arr.map((n: any, i: number): NodeOption => {
+        if (!n || typeof n.url !== "string" || typeof n.auth !== "string") {
+          throw new Error(`node #${i + 1} needs "url" ("host:port") and "auth"`);
+        }
+        let name = String(n.name || `node${i + 1}`);
+        if (seen.has(name)) name = `${name}-${i + 1}`;
+        seen.add(name);
+        return { name, url: n.url, auth: n.auth, secure: n.secure === true || n.secure === "true" };
+      });
+      console.log(`[lavalink] ${nodes.length} nodes (priority order): ${nodes.map((n) => n.name).join(" → ")}`);
+      return nodes;
+    } catch (e: any) {
+      console.warn(`[lavalink] LAVALINK_NODES is invalid (${e?.message ?? e}) — using LAVALINK_HOST instead`);
+    }
+  }
+  return [{ name: "main", url: HOST, auth: PASSWORD, secure: SECURE }];
+}
+
+export interface Track {
+  title: string;
+  uri?: string;
+  lengthMs: number;
+  /** Source id (e.g. YouTube video id). Stable across Lavalink events, unlike `encoded`. */
+  identifier?: string;
+  /** Lavalink-encoded track data (what actually gets played). */
+  encoded: string;
+  /** Channel / artist name, when the source provides one (e.g. the YouTube channel). */
+  author?: string;
+  /** Thumbnail / album-art URL. Lavalink (youtube-source) fills this in from the video itself. */
+  artworkUrl?: string;
+  /** True for livestreams — `lengthMs` isn't a real duration then. */
+  isStream?: boolean;
+  /** e.g. "youtube". Lets the UI say where a track came from without guessing from the URL. */
+  sourceName?: string;
+  /** Discord user id of whoever asked for it (typed in the music room / a button). */
+  requestedBy?: string;
+  /** Which request this song answers (see history.ts queryKey) — lets history learn "request → video". */
+  queryKey?: string;
+  /** True when the song was picked from the play history instead of a fresh YouTube search. */
+  fromHistory?: boolean;
+  /** Already saved to the song history when it was queued — startTrack must not count it a second time. */
+  historyCounted?: boolean;
+  /** Name of the voice channel it plays in — filled in by the player panel for display only. */
+  voiceChannelName?: string;
+}
+
+/** What happened to a pasted playlist (see LavalinkMusic.enqueue). */
+export interface PlaylistInfo {
+  name: string;
+  /** Songs that made it in (the one that started right away + the ones queued). */
+  added: number;
+  /** Playable songs left out because the queue was full. */
+  dropped: number;
+  /** Songs left out because they can't be played (livestream, longer than MUSIC_MAX_MINUTES). */
+  skipped: number;
+}
+
+/** Lavalink track (search / load result) → our Track. */
+function toTrack(c: any): Track {
+  return {
+    title: c.info.title,
+    uri: c.info.uri,
+    lengthMs: c.info.length,
+    identifier: c.info.identifier,
+    encoded: c.encoded,
+    author: c.info.author,
+    artworkUrl: c.info.artworkUrl,
+    isStream: c.info.isStream,
+    sourceName: c.info.sourceName,
+  };
+}
+
+/** How many already-played songs the ⏮ button can walk back through. */
+const HISTORY_MAX = 20;
+
+/** Skipping a song sooner than this after it started means the pick was probably wrong. */
+const EARLY_SKIP_MS = 20_000;
+
+export class LavalinkMusic {
+  private shoukaku: Shoukaku;
+  /** Configured nodes, in priority order (first = preferred). */
+  private readonly nodeOpts: NodeOption[] = loadNodes();
+  /** Nodes that have a pending "try to bring it back" timer. */
+  private reviving = new Set<string>();
+  /** Consecutive failed revive rounds per node — drives the exponential backoff. */
+  private reviveFails = new Map<string, number>();
+  /** Nodes that answered close 4000 / HTTP 429: the server is rate-limiting this bot, so wait much longer. */
+  private rateLimited = new Set<string>();
+  private now = new Map<string, Track>();
+  /** Epoch ms when the current song started. Used only to draw a progress bar. */
+  private startedAt = new Map<string, number>();
+  /** Per-guild volume in percent (0–100); survives across songs. */
+  private volume = new Map<string, number>();
+  /** Bumped on every play()/stop()/leave() so a slow search can't override a newer request. */
+  private req = new Map<string, number>();
+  private hooked = new WeakSet<Player>();
+  /** Called whenever the current song or the queue changes (used to refresh the queue embed). */
+  onChange: ((guildId: string) => void) | null = null;
+  /** Songs waiting after the current one (1 = next up). */
+  private queues = new Map<string, TrackQueue<Track>>();
+  /** Epoch ms when playback was paused (present = paused). */
+  private pausedAt = new Map<string, number>();
+  /** Per-guild loop mode. */
+  private loops = new Map<string, LoopMode>();
+  /** Songs that played before the current one, oldest first (for ⏮). */
+  private history = new Map<string, Track[]>();
+  /** The song most recently started — moves into `history` when the next one starts. */
+  private lastStarted = new Map<string, Track>();
+
+  /** Voice channel the bot is in, per guild (set when it joins, cleared on leave). */
+  private channels = new Map<string, string>();
+
+  /**
+   * `client` = the bot's discord.js Client (must have the Guilds + GuildVoiceStates intents).
+   * `songHistory` = the song-history database; null/omitted = no history (every request is a fresh search).
+   */
+  constructor(
+    private readonly client: Client,
+    private readonly songHistory: MusicHistory | null = null,
+  ) {
+    // Shoukaku v4 times are in SECONDS (restTimeout used to be 15_000 here = ~4 hours, which
+    // would make a hung node block every search instead of failing over).
+    this.shoukaku = new Shoukaku(
+      new Connectors.DiscordJS(this.client),
+      this.nodeOpts,
+      {
+        // A node that stays down → its players move to the next connected node and keep playing.
+        moveOnDisconnect: true,
+        resume: false,
+        reconnectTries: 1, // 1 quick retry (~5 s), then failover. Slower retries are scheduleRevive()'s job (with backoff).
+        reconnectInterval: 5,
+        restTimeout: 15,
+        // Fallback order, not load balancing: always the first CONNECTED node in the list.
+        nodeResolver: (nodes) =>
+          this.nodeOpts
+            .map((o) => nodes.get(o.name))
+            .find((n) => n?.state === Constants.State.CONNECTED),
+      },
+    );
+    // Unhandled 'error' events would crash the process.
+    this.shoukaku.on("error", (name, e) => {
+      const msg = String(e?.message ?? e);
+      if (msg.includes("429")) this.rateLimited.add(name);
+      console.warn(`[lavalink] node ${name} error:`, msg);
+    });
+    this.shoukaku.on("ready", (name) => {
+      this.reviveFails.delete(name);
+      this.rateLimited.delete(name);
+      console.log(`[lavalink] node ${name} ready`);
+    });
+    this.shoukaku.on("close", (name, code, reason) => {
+      // 4000 = "Too many websocket connections attempt for this bot" (free public Lavalink).
+      if (code === 4000) this.rateLimited.add(name);
+      // Print the long provider message once per failure streak, not on every retry.
+      const first = !this.reviveFails.has(name) && !this.reviving.has(name);
+      console.warn(`[lavalink] node ${name} closed (${code}) ${first ? (reason ?? "") : ""}`.trimEnd());
+    });
+    this.shoukaku.on("disconnect", (name, moved) => {
+      console.warn(`[lavalink] node ${name} disconnected (${moved} player(s) moved to another node)`);
+      this.scheduleRevive(name);
+    });
+  }
+
+  /**
+   * Shoukaku never reuses a node that gave up, so re-add it a bit later. If it is still dead it
+   * fails again and this schedules the next try. Players stay on the fallback; only NEW songs
+   * go back to the preferred node once it is connected.
+   */
+  private scheduleRevive(name: string): void {
+    if (REVIVE_MS <= 0 || REVIVE_DISABLED || this.reviving.has(name)) return;
+    const opts = this.nodeOpts.find((o) => o.name === name);
+    if (!opts) return;
+    this.reviving.add(name);
+    // Exponential backoff (30 s, 60 s, 2 min … capped at 10 min) + jitter. A node that rate-limited
+    // us waits at least 5 min: hammering a free public node is what gets an IP blacklisted.
+    const fails = this.reviveFails.get(name) ?? 0;
+    this.reviveFails.set(name, fails + 1);
+    let delay = Math.min(REVIVE_MS * 2 ** fails, 600_000);
+    if (this.rateLimited.has(name)) delay = Math.max(delay, 300_000);
+    delay += Math.floor(Math.random() * 5_000);
+    console.log(`[lavalink] node ${name} down — next retry in ${Math.round(delay / 1000)}s`);
+    const t = setTimeout(() => {
+      this.reviving.delete(name);
+      if (this.shoukaku.nodes.has(name)) return;
+      console.log(`[lavalink] retrying node ${name}…`);
+      try {
+        this.shoukaku.addNode(opts);
+      } catch (e: any) {
+        console.warn(`[lavalink] could not re-add node ${name}:`, e?.message ?? e);
+        this.scheduleRevive(name);
+      }
+    }, delay);
+    t.unref?.();
+  }
+
+  /** Close every node socket cleanly (call on shutdown) so the server frees this bot's connection slots. */
+  shutdown(): void {
+    REVIVE_DISABLED = true;
+    for (const name of [...this.shoukaku.nodes.keys()]) {
+      try {
+        this.shoukaku.removeNode(name, "shutdown");
+      } catch {}
+    }
+  }
+
+  /** Connected nodes, preferred first. */
+  private connectedNodes(): Node[] {
+    return this.nodeOpts
+      .map((o) => this.shoukaku.nodes.get(o.name))
+      .filter((n): n is Node => !!n && n.state === Constants.State.CONNECTED);
+  }
+
+  /**
+   * node.rest.resolve() with failover: if a node throws (timeout, 5xx) or answers loadType
+   * "error" (e.g. its YouTube source is blocked), the next connected node is tried.
+   * "empty" is a real answer ("no such song") and is returned as is.
+   */
+  private async resolve(identifier: string): Promise<any> {
+    const nodes = this.connectedNodes();
+    if (nodes.length === 0) throw new Error("Lavalink ยังไม่พร้อม (ยังไม่ได้เชื่อมต่อ node)");
+    let lastErr: Error = new Error("Lavalink load failed: unknown");
+    for (const node of nodes) {
+      try {
+        const res: any = await node.rest.resolve(identifier);
+        if (res && res.loadType !== "error") return res;
+        lastErr = new Error(`Lavalink load failed: ${res?.data?.message ?? "unknown"}`);
+      } catch (e: any) {
+        lastErr = e instanceof Error ? e : new Error(String(e));
+      }
+      console.warn(`[lavalink] node ${node.name} could not load "${identifier}": ${lastErr.message}`);
+    }
+    throw lastErr;
+  }
+
+  private bump(guildId: string): number {
+    const id = (this.req.get(guildId) ?? 0) + 1;
+    this.req.set(guildId, id);
+    return id;
+  }
+
+  getVolume(guildId: string): number {
+    return this.volume.get(guildId) ?? DEFAULT_VOLUME_PCT;
+  }
+
+  /** Change volume by `delta` percent (clamped to 0–100). Returns the new volume. */
+  async changeVolume(guildId: string, delta: number): Promise<number> {
+    const next = Math.min(100, Math.max(0, this.getVolume(guildId) + delta));
+    this.volume.set(guildId, next);
+    const player = this.shoukaku.players.get(guildId);
+    if (player) await player.setGlobalVolume(next);
+    console.log(`[music] volume → ${next}%`);
+    this.changed(guildId); // the player embed shows the volume
+    return next;
+  }
+
+  nowPlaying(guildId: string): Track | null {
+    return this.now.get(guildId) ?? null;
+  }
+
+  /** Epoch ms when the current song started; null if nothing is playing. */
+  playingSince(guildId: string): number | null {
+    return this.startedAt.get(guildId) ?? null;
+  }
+
+  /** How far into the current song we are (frozen while paused); null if nothing is playing. */
+  positionMs(guildId: string): number | null {
+    const started = this.startedAt.get(guildId);
+    if (started === undefined) return null;
+    return Math.max(0, (this.pausedAt.get(guildId) ?? Date.now()) - started);
+  }
+
+  isPaused(guildId: string): boolean {
+    return this.pausedAt.has(guildId);
+  }
+
+  getLoop(guildId: string): LoopMode {
+    return this.loops.get(guildId) ?? "none";
+  }
+
+  /** none → track → queue → none. Returns the new mode. */
+  cycleLoop(guildId: string): LoopMode {
+    const order: LoopMode[] = ["none", "track", "queue"];
+    const next = order[(order.indexOf(this.getLoop(guildId)) + 1) % order.length]!;
+    this.loops.set(guildId, next);
+    console.log(`[music] loop → ${next}`);
+    this.changed(guildId);
+    return next;
+  }
+
+  isPlaying(guildId: string): boolean {
+    return this.now.has(guildId);
+  }
+
+  /**
+   * Set the current track and stamp when it started. The song that was started before it
+   * moves into the history (unless `pushHistory` is false: ⏮ and loop-this-song replays).
+   */
+  private setNowPlaying(guildId: string, track: Track, pushHistory = true): void {
+    const last = this.lastStarted.get(guildId);
+    if (pushHistory && last && last !== track) {
+      let h = this.history.get(guildId);
+      if (!h) this.history.set(guildId, (h = []));
+      h.push(last);
+      if (h.length > HISTORY_MAX) h.shift();
+    }
+    this.lastStarted.set(guildId, track);
+    this.now.set(guildId, track);
+    this.startedAt.set(guildId, Date.now());
+    this.pausedAt.delete(guildId); // a new song always starts un-paused
+  }
+
+  /** Clear the current track (ended / stopped / failed). */
+  private clearNowPlaying(guildId: string): void {
+    this.now.delete(guildId);
+    this.startedAt.delete(guildId);
+    this.pausedAt.delete(guildId);
+  }
+
+  private changed(guildId: string): void {
+    try {
+      this.onChange?.(guildId);
+    } catch (e) {
+      console.warn("[music] onChange handler threw:", e);
+    }
+  }
+
+  private queueFor(guildId: string): TrackQueue<Track> {
+    let q = this.queues.get(guildId);
+    if (!q) {
+      q = new TrackQueue<Track>(MAX_QUEUE);
+      this.queues.set(guildId, q);
+    }
+    return q;
+  }
+
+  getQueue(guildId: string): Track[] {
+    return this.queues.get(guildId)?.list() ?? [];
+  }
+
+  /** Remove queue item #`index` (1 = next up). Returns the removed track or null. */
+  removeFromQueue(guildId: string, index: number): Track | null {
+    const removed = this.queues.get(guildId)?.remove(index) ?? null;
+    if (removed) this.changed(guildId);
+    return removed;
+  }
+
+  /**
+   * ▶ Play queue item #`index` (1 = next up) RIGHT NOW — the "เล่นเลย" button of the queue dropdown.
+   * The song is taken out of the queue; the one that was playing is replaced. Like skip(), with
+   * loop-queue on it goes to the back of the line; otherwise it lands in the history, so ⏮ can
+   * still bring it back. The rest of the queue keeps its order.
+   * Returns the song now playing, or null when there is no such item / nothing to play it on.
+   * Throws if Lavalink refuses to start it (the song is then put back at the front of the queue).
+   */
+  async playFromQueue(guildId: string, index: number): Promise<Track | null> {
+    const q = this.queues.get(guildId);
+    const player = this.shoukaku.players.get(guildId);
+    if (!q || !player) return null;
+    const track = q.remove(index);
+    if (!track) return null;
+    this.bump(guildId); // a slow search for an earlier request must not override this pick
+    const cur = this.now.get(guildId);
+    try {
+      await this.startTrack(guildId, player, track); // old song ends as 'replaced' → ignored
+    } catch (e) {
+      q.unshift(track); // couldn't start it — don't lose it
+      this.changed(guildId);
+      throw e;
+    }
+    if (cur && this.getLoop(guildId) === "queue") q.push(cur);
+    this.changed(guildId);
+    return track;
+  }
+
+  /**
+   * Search YouTube and return the best playable result (no streams, not too long).
+   * "<song> ของ <artist>" is rewritten to "<artist> <song>" and the result's title must
+   * contain the song name (see music/query.ts).
+   * A YouTube video link is loaded directly instead of searched (no "ytsearch:" prefix).
+   */
+  private async search(guildId: string, query: string): Promise<Track | null> {
+    const q = parseMusicQuery(query);
+    // A playlist link given to a "play now" request: play its first song (enqueue() takes all of it).
+    if (q.playlistUrl) return (await this.loadPlaylist(q.playlistUrl))?.tracks[0] ?? null;
+
+    // Asked for before in this server? Play the same video again instead of trusting the search ranking.
+    const key = q.directUrl ? "" : queryKey(q);
+    if (!q.directUrl) {
+      const remembered = await this.recall(guildId, q, key);
+      if (remembered) return remembered;
+    }
+
+    for (const text of q.searches) {
+      const res: any = await this.resolve(q.directUrl ? text : `${SEARCH_PREFIX}${text}`);
+      const candidates: any[] =
+        res.loadType === "search" ? res.data : res.loadType === "track" ? [res.data] : [];
+      const picked = pickCandidate(candidates, q, MAX_MS);
+      if (picked) {
+        const track = toTrack(picked);
+        if (key) track.queryKey = key;
+        return track;
+      }
+      console.log(`[music] no match for "${text}"`);
+    }
+    return null;
+  }
+
+  /**
+   * Look the request up in the play history. Returns the remembered song (re-loaded from YouTube,
+   * so a deleted / blocked video is noticed) or null → fall back to a normal search.
+   */
+  private async recall(
+    guildId: string,
+    q: MusicQuery,
+    key: string,
+  ): Promise<Track | null> {
+    if (!this.songHistory) return null;
+    const match = this.songHistory.lookup(guildId, q, MAX_MS);
+    if (!match) return null;
+    try {
+      const res: any = await this.resolve(match.track.uri!);
+      if (res?.loadType === "track" && res.data && filterPlayable([res.data], MAX_MS).length > 0) {
+        console.log(
+          `[music] 🕘 history (${match.how}, played ${match.plays}x): "${q.song}" → ${match.track.title}`,
+        );
+        const track = toTrack(res.data);
+        if (key) track.queryKey = key;
+        track.fromHistory = true;
+        return track;
+      }
+      console.log(`[music] history pick no longer loads (${match.track.uri}) — searching instead`);
+    } catch (e: any) {
+      console.warn("[music] history lookup failed, searching instead:", e?.message ?? e);
+    }
+    return null;
+  }
+
+  /**
+   * Load a YouTube playlist link. Returns its playable songs (no streams, none longer than
+   * MUSIC_MAX_MINUTES) in playlist order, or null when it is empty / has nothing playable.
+   */
+  private async loadPlaylist(
+    url: string,
+  ): Promise<{ name: string; tracks: Track[]; skipped: number } | null> {
+    const res: any = await this.resolve(url);
+    if (res.loadType !== "playlist") return null;
+
+    const all: any[] = res.data?.tracks ?? [];
+    const tracks = filterPlayable(all, MAX_MS).map(toTrack);
+    if (tracks.length === 0) {
+      console.log(`[music] playlist ${url}: nothing playable (${all.length} tracks)`);
+      return null;
+    }
+    return { name: String(res.data?.info?.name ?? ""), tracks, skipped: all.length - tracks.length };
+  }
+
+  /**
+   * Playlist link: nothing playing → its first song starts now and the rest queue up behind it;
+   * otherwise every song is appended to the queue. Stops when the queue is full.
+   * Returns null when nothing playable was found / nothing fit in the queue.
+   */
+  private async enqueuePlaylist(
+    guildId: string,
+    channelId: string,
+    url: string,
+    requestedBy?: string,
+  ): Promise<{ track: Track; position: number; playlist: PlaylistInfo } | null> {
+    const pl = await this.loadPlaylist(url);
+    if (!pl) {
+      return null;
+    }
+    const tracks = pl.tracks.map((t) => ({ ...t, requestedBy }));
+    const first = tracks[0]!;
+
+    let position: number | null = null; // where `first` ended up (0 = playing now)
+    let startedNow = false;
+    if (!this.now.has(guildId)) {
+      const id = this.bump(guildId);
+      const player = await this.ensurePlayer(guildId, channelId);
+      // A newer request (or another song) may have taken over while the player was joining.
+      if (id === this.req.get(guildId) && !this.now.has(guildId)) {
+        this.hook(guildId, player);
+        await this.startTrack(guildId, player, tracks.shift()!);
+        startedNow = true;
+        position = 0;
+      }
+    }
+
+    const q = this.queueFor(guildId);
+    let queued = 0;
+    for (const t of tracks) {
+      const pos = q.push(t);
+      if (pos === null) break; // queue full
+      this.countQueued(guildId, t);
+      position ??= pos;
+      queued++;
+    }
+    if (queued > 0) this.changed(guildId);
+
+    if (position === null) {
+      console.warn(`[music] queue full (${MAX_QUEUE}) — dropped playlist "${pl.name}"`);
+      return null;
+    }
+    const added = queued + (startedNow ? 1 : 0);
+    console.log(`[music] 📃 playlist "${pl.name}": ${added}/${pl.tracks.length} songs added`);
+    return {
+      track: first,
+      position,
+      playlist: {
+        name: pl.name,
+        added,
+        dropped: pl.tracks.length - added,
+        skipped: pl.skipped,
+      },
+    };
+  }
+
+  /** Voice channel the bot is currently in for this guild, or null when it is not in one. */
+  channelId(guildId: string): string | null {
+    return this.channels.get(guildId) ?? null;
+  }
+
+  /** The bot was moved to another voice channel by someone: follow it (ignored when we are not in one). */
+  noteMoved(guildId: string, channelId: string): void {
+    if (this.channels.has(guildId)) this.channels.set(guildId, channelId);
+  }
+
+  /** Join `channelId` (no song needed). No-op when the bot is already in a channel of this guild. */
+  async join(guildId: string, channelId: string): Promise<void> {
+    await this.ensurePlayer(guildId, channelId);
+  }
+
+  /** Get the guild's player, joining `channelId` if the bot is not in a voice channel yet. */
+  private async ensurePlayer(guildId: string, channelId: string): Promise<Player> {
+    const guild = this.client.guilds.cache.get(guildId);
+    if (!guild) {
+      throw new Error("บอทยังไม่ได้อยู่ในเซิร์ฟเวอร์นี้");
+    }
+    let player = this.shoukaku.players.get(guildId);
+    if (!player) {
+      player = await this.shoukaku.joinVoiceChannel({
+        guildId,
+        channelId,
+        shardId: guild.shardId,
+        deaf: true,
+      });
+      this.channels.set(guildId, channelId);
+    }
+    return player;
+  }
+
+  /**
+   * A song just joined the queue: save it to the song history now (so it shows up in 🕘 and counts
+   * toward "most played" even if it is removed or never reached), and mark it so startTrack()
+   * doesn't count it again when it starts.
+   */
+  private countQueued(guildId: string, track: Track): void {
+    if (track.historyCounted) return;
+    this.songHistory?.recordPlay(guildId, track);
+    track.historyCounted = true;
+  }
+
+  private async startTrack(
+    guildId: string,
+    player: Player,
+    track: Track,
+    opts: { pushHistory?: boolean } = {},
+  ): Promise<void> {
+    await player.setGlobalVolume(this.getVolume(guildId));
+    // paused:false — Lavalink keeps the player's paused flag across songs, so a song started
+    // while paused (skip / ⏮ / next in queue) would otherwise stay silent.
+    await player.playTrack({ track: { encoded: track.encoded }, paused: false });
+    const fresh = opts.pushHistory ?? true;
+    this.setNowPlaying(guildId, track, fresh);
+    // ⏮ and loop replays pass pushHistory:false — they are not new plays, so they aren't counted.
+    // A song that was counted when it joined the queue is not counted again; the flag is used up
+    // here, so a loop-queue lap (which re-queues the same object) counts as a new play.
+    if (track.historyCounted) track.historyCounted = false;
+    else if (fresh) this.songHistory?.recordPlay(guildId, track);
+    console.log(`[music] ▶ ${track.title} (${track.uri ?? "?"})`);
+    this.changed(guildId);
+  }
+
+  /**
+   * Search and play the top result NOW in `channelId` (the music bot joins it if needed).
+   * Replaces the current song; the queue is kept.
+   * Returns the track, or null if nothing playable was found / a newer request won.
+   */
+  async play(
+    guildId: string,
+    channelId: string,
+    query: string,
+    requestedBy?: string,
+  ): Promise<Track | null> {
+    const id = this.bump(guildId);
+
+    const track = await this.search(guildId, query);
+    if (track) track.requestedBy = requestedBy;
+    if (id !== this.req.get(guildId)) return null;
+    if (!track) {
+      return null;
+    }
+
+    const player = await this.ensurePlayer(guildId, channelId);
+    if (id !== this.req.get(guildId)) return null;
+    this.hook(guildId, player);
+
+    await this.startTrack(guildId, player, track);
+    return track;
+  }
+
+  /**
+   * "เพิ่มเพลง": nothing playing → play it now (position 0); otherwise append to the
+   * queue. Returns the track and its position (0 = playing now, N = Nth in queue),
+   * or null if nothing playable was found / the queue is full.
+   * A playlist link adds the whole playlist (see enqueuePlaylist); `playlist` is then set and
+   * `track`/`position` describe its first song.
+   */
+  async enqueue(
+    guildId: string,
+    channelId: string,
+    query: string,
+    requestedBy?: string,
+  ): Promise<{ track: Track; position: number; playlist?: PlaylistInfo } | null> {
+    const pq = parseMusicQuery(query);
+    if (pq.playlistUrl) return this.enqueuePlaylist(guildId, channelId, pq.playlistUrl, requestedBy);
+
+    if (!this.now.has(guildId)) {
+      const track = await this.play(guildId, channelId, query, requestedBy);
+      return track ? { track, position: 0 } : null;
+    }
+
+    const track = await this.search(guildId, query);
+    if (!track) {
+      return null;
+    }
+    track.requestedBy = requestedBy;
+    const position = this.queueFor(guildId).push(track);
+    if (position === null) {
+      console.warn(`[music] queue full (${MAX_QUEUE}) — dropped "${track.title}"`);
+      return null;
+    }
+    console.log(`[music] ➕ queued #${position}: ${track.title}`);
+    this.countQueued(guildId, track);
+    this.changed(guildId);
+
+    // The current song may have ended while we were searching → nothing would pick this up.
+    if (!this.now.has(guildId)) {
+      const player = this.shoukaku.players.get(guildId);
+      if (player) {
+        this.hook(guildId, player);
+        const started = await this.advance(guildId);
+        if (started) return { track, position: 0 };
+      }
+    }
+    return { track, position };
+  }
+
+  /**
+   * Start the next queued song. Returns false when the queue is empty.
+   * `natural` = the previous song ended on its own (not a skip / enqueue).
+   */
+  private async advance(guildId: string, natural = false): Promise<boolean> {
+    const q = this.queues.get(guildId);
+    const player = this.shoukaku.players.get(guildId);
+    if (!q || !player) return false;
+    const next = q.shift();
+    if (!next) return false;
+    try {
+      await this.startTrack(guildId, player, next);
+      return true;
+    } catch (e: any) {
+      console.warn(`[music] could not start queued "${next.title}":`, e?.message ?? e);
+      this.clearNowPlaying(guildId);
+      this.changed(guildId);
+      return this.advance(guildId, natural); // try the one after it
+    }
+  }
+
+  /**
+   * Skip the current song: jump to the next queued one, or stop if the queue is empty.
+   * Returns what was skipped (null if nothing was playing) and what plays now (null if none).
+   */
+  async skip(guildId: string): Promise<{ skipped: Track | null; next: Track | null }> {
+    const skipped = this.now.get(guildId) ?? null;
+    if (!skipped) return { skipped: null, next: null };
+    // Skipped within seconds of starting = the request probably resolved to the wrong video.
+    const heard = this.positionMs(guildId);
+    if (skipped.queryKey && skipped.identifier && heard !== null && heard < EARLY_SKIP_MS) {
+      this.songHistory?.reject(guildId, skipped.queryKey, skipped.identifier);
+    }
+    // Loop-queue: the skipped song goes to the back of the line instead of being dropped.
+    if (this.getLoop(guildId) === "queue") this.queueFor(guildId).push(skipped);
+    const started = await this.advance(guildId); // old song ends as 'replaced' → ignored
+    if (!started) {
+      await this.stop(guildId);
+      return { skipped, next: null };
+    }
+    return { skipped, next: this.now.get(guildId) ?? null };
+  }
+
+  /** ⏯ Pause / resume. Returns the new paused state, or null when nothing is playing. */
+  async togglePause(guildId: string): Promise<boolean | null> {
+    const player = this.shoukaku.players.get(guildId);
+    if (!player || !this.now.has(guildId)) return null;
+    const pause = !this.pausedAt.has(guildId);
+    await player.setPaused(pause);
+    if (pause) {
+      this.pausedAt.set(guildId, Date.now());
+    } else {
+      // Push the start time forward by the time spent paused, so positionMs() keeps counting
+      // from where it stopped.
+      const since = this.pausedAt.get(guildId) ?? Date.now();
+      this.startedAt.set(guildId, (this.startedAt.get(guildId) ?? Date.now()) + (Date.now() - since));
+      this.pausedAt.delete(guildId);
+    }
+    console.log(`[music] ${pause ? "⏸ paused" : "▶ resumed"}`);
+    this.changed(guildId);
+    return pause;
+  }
+
+  /** 🔀 Shuffle the queue (not the current song). Returns false when the queue has < 2 songs. */
+  shuffleQueue(guildId: string): boolean {
+    const done = this.queues.get(guildId)?.shuffle() ?? false;
+    if (done) this.changed(guildId);
+    return done;
+  }
+
+  /**
+   * ⏮ Go back to the song that played before. The current song is put at the front of the
+   * queue so nothing is lost. Returns the song now playing, or null when there is no history.
+   */
+  async previous(guildId: string): Promise<Track | null> {
+    const player = this.shoukaku.players.get(guildId);
+    const h = this.history.get(guildId);
+    if (!player || !h || h.length === 0) return null;
+    const prev = h.pop()!;
+    this.bump(guildId); // a slow search for an older request must not override this
+    const cur = this.now.get(guildId);
+    if (cur) this.queueFor(guildId).unshift(cur);
+    try {
+      await this.startTrack(guildId, player, prev, { pushHistory: false });
+    } catch (e) {
+      h.push(prev); // couldn't start it — keep it for another try
+      if (cur) this.queues.get(guildId)?.remove(1);
+      throw e;
+    }
+    return prev;
+  }
+
+  /** Stop the current song AND clear the queue; the music bot stays in the channel. */
+  async stop(guildId: string): Promise<void> {
+    this.bump(guildId);
+    this.clearNowPlaying(guildId);
+    this.queues.get(guildId)?.clear();
+    this.changed(guildId);
+    const player = this.shoukaku.players.get(guildId);
+    if (player) await player.stopTrack().catch(() => {});
+  }
+
+  /** Stop and leave the voice channel. */
+  async leave(guildId: string): Promise<void> {
+    this.bump(guildId);
+    this.clearNowPlaying(guildId);
+    this.queues.get(guildId)?.clear();
+    this.history.delete(guildId);
+    this.lastStarted.delete(guildId);
+    this.loops.delete(guildId);
+    this.channels.delete(guildId);
+    this.changed(guildId);
+    if (!this.shoukaku.players.has(guildId)) return;
+    try {
+      await this.shoukaku.leaveVoiceChannel(guildId);
+    } catch (e: any) {
+      console.warn("[lavalink] leave failed:", e?.message ?? e);
+    }
+  }
+
+  private hook(guildId: string, player: Player): void {
+    if (this.hooked.has(player)) return;
+    this.hooked.add(player);
+
+    // Ignore events about a song that is no longer the current one.
+    // NOTE: compare the track *identifier*, not `encoded`. Lavalink re-encodes the track
+    // for events and the encoding includes the playback position, so on 'finished' the
+    // string never equals the one we started with → every natural end looked "stale"
+    // and the queue never advanced.
+    const isStale = (ev: any): boolean => {
+      const cur = this.now.get(guildId);
+      const evId = ev?.track?.info?.identifier;
+      return !!cur && !!cur.identifier && !!evId && cur.identifier !== evId;
+    };
+    // Natural end → next song (false when the queue is empty).
+    const advanceLogged = (): Promise<boolean> =>
+      this.advance(guildId, true).catch((e: any) => {
+        console.warn("[music] advance failed:", e?.message ?? e);
+        return false;
+      });
+
+    player.on("end", (ev: any) => {
+      const reason = String(ev?.reason ?? "").toLowerCase();
+      const stale = isStale(ev);
+      console.log(`[music] end event: reason=${reason} stale=${stale} queue=${this.getQueue(guildId).length}`);
+      // 'replaced' = a newer song took over — don't clear its "now playing".
+      if (reason === "replaced" || stale) return;
+      // Loop: only when the song really finished (not on loadFailed, or a broken song would repeat forever).
+      const cur = this.now.get(guildId);
+      if (reason === "finished" && cur) {
+        const mode = this.getLoop(guildId);
+        if (mode === "track") {
+          this.startTrack(guildId, player, cur, { pushHistory: false }).catch((e: any) =>
+            console.warn("[music] loop replay failed:", e?.message ?? e),
+          );
+          return;
+        }
+        if (mode === "queue") this.queueFor(guildId).push(cur); // back of the line, then advance
+      }
+      this.clearNowPlaying(guildId);
+      this.changed(guildId);
+      // Song ended on its own (or failed to load) → next in the queue.
+      // 'stopped' (stop/clear) and 'cleanup' deliberately do NOT advance.
+      if (reason === "finished" || reason === "loadfailed") void advanceLogged();
+    });
+    player.on("exception", (ev: any) => {
+      console.warn("[lavalink] track exception:", ev?.exception?.message ?? ev);
+      this.clearNowPlaying(guildId); // the following 'end' (loadFailed) moves on
+      this.changed(guildId);
+    });
+    player.on("stuck", (ev: any) => {
+      if (isStale(ev)) return;
+      this.clearNowPlaying(guildId);
+      this.changed(guildId);
+      void advanceLogged()
+        .then((started) => (started ? undefined : player.stopTrack()))
+        .catch(() => {});
+    });
+    player.on("closed", () => {
+      this.clearNowPlaying(guildId);
+      this.queues.get(guildId)?.clear();
+      this.changed(guildId);
+    });
+  }
+}

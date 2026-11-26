@@ -1,0 +1,28 @@
+{
+  "name": "earth-music-bot",
+  "version": "0.3.0",
+  "type": "module",
+  "private": true,
+  "description": "Discord music bot — plays YouTube through Lavalink. One bot, slash commands + a Components V2 player panel + song requests typed in a music room. No voice recognition.",
+  "license": "MIT",
+  "scripts": {
+    "register": "bun src/register-commands.ts",
+    "start": "bun src/index.ts",
+    "dev": "bun --watch src/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^1.1.0",
+    "discord.js": "^14.22.0",
+    "shoukaku": "^4.1.1"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  },
+  "trustedDependencies": [
+    "@napi-rs/canvas"
+  ]
+}
