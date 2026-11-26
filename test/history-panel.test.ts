@@ -65,4 +65,22 @@ describe("history panel", () => {
     expect(parseHistoryId("mh:sort:p:0")).toEqual({ kind: "page", sort: "plays", page: 0, videoId: null });
     expect(parseHistoryId("mh:noop")).toBeNull();
   });
+
+  test("custom emoji are in the emoji slot, never written into a button label (it would show as raw text)", () => {
+    const labels: string[] = [];
+    const emojis: { id?: string; name?: string }[] = [];
+    const walk = (n: unknown) => {
+      if (Array.isArray(n)) return n.forEach(walk);
+      if (!n || typeof n !== "object") return;
+      const o = n as Record<string, any>;
+      if (typeof o.label === "string") labels.push(o.label);
+      if (o.emoji && typeof o.emoji === "object") emojis.push(o.emoji);
+      Object.values(o).forEach(walk);
+    };
+    const entries = Array.from({ length: HISTORY_PAGE_SIZE }, (_, i) => entry(i));
+    walk(buildHistoryPanel({ entries, sort: "recent", page: 1, pages: 5, total: 105 }).toJSON());
+    expect(labels.filter((l) => l.includes("<:") || l.includes("<a:"))).toEqual([]);
+    // ◀ and ▶ are real emoji now: two custom ones (+ the 🕘 / 🔥 on the sort buttons)
+    expect(emojis.filter((e) => e.id).length).toBe(2);
+  });
 });

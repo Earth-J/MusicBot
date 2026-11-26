@@ -381,24 +381,28 @@ export function buildHistoryPanel({ entries, sort, page, pages, total, notice }:
 
 /** ⏮ first · <:Gemini_Generated_Image_402sjg402:1569243289964519494> previous · "2/5" · <:4303discordcategorycollapsedwhit:1569242059251130389> next · ⏭ last (the ends grey out on the first / last page). */
 function buildHistoryNavRow(page: number, pages: number, sort: HistorySort): ActionRowBuilder<ButtonBuilder> {
-  const go = (kind: NavKind, label: string, target: number, off: boolean) =>
-    new ButtonBuilder()
+  // A custom emoji (<:name:id>) only renders in the emoji slot — in a label it shows as raw text.
+  const go = (kind: NavKind, face: { label?: string; emoji?: string }, target: number, off: boolean) => {
+    const b = new ButtonBuilder()
       .setCustomId(navId(kind, sort, target))
-      .setLabel(label)
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(off);
+    if (face.emoji) b.setEmoji(face.emoji);
+    if (face.label) b.setLabel(face.label);
+    return b;
+  };
   const first = page <= 0;
   const last = page >= pages - 1;
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    go("first", "⏮", 0, first),
-    go("prev", "<:Gemini_Generated_Image_402sjg402:1569243289964519494>", page - 1, first),
+    go("first", { label: "⏮" }, 0, first),
+    go("prev", { emoji: "<:Gemini_Generated_Image_402sjg402:1569243289964519494>" }, page - 1, first),
     new ButtonBuilder()
       .setCustomId(HISTORY_ID.indicator)
       .setLabel(`${page + 1}/${pages}`)
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(true),
-    go("next", "<:4303discordcategorycollapsedwhit:1569242059251130389>", page + 1, last),
-    go("last", "⏭", pages - 1, last),
+    go("next", { emoji: "<:4303discordcategorycollapsedwhit:1569242059251130389>" }, page + 1, last),
+    go("last", { label: "⏭" }, pages - 1, last),
   );
 }
 
